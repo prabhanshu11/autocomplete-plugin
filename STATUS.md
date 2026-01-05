@@ -61,13 +61,15 @@ All features implemented and tested. **2,400+ lines** of code across Lua, Python
 
 ## 📊 Test Results
 
-| Model | Cost | Status |
-|-------|------|--------|
-| Gemini 3 Flash | $0.000031 | ✅ Tested |
-| Gemini 2.5 Flash | $0.000022 | ✅ Tested |
-| DeepSeek Chat | $0.000016 | ✅ Tested |
-| Kimi K2 | $0.000040 | ✅ Tested |
-| Claude 3.5 Haiku | $0.000065 | ✅ Tested |
+| Model | Cost (Req) | 10k Words | 1 Month | Status |
+|-------|------------|-----------|---------|--------|
+| Gemini 3 Flash | $0.000031 | $0.012 | $0.36 | ✅ Tested |
+| Gemini 2.5 Flash | $0.000022 | $0.008 | $0.24 | ✅ Tested |
+| DeepSeek Chat | $0.000016 | $0.004 | $0.12 | ✅ Tested |
+| Kimi K2 | $0.000040 | $0.008 | $0.24 | ✅ Tested |
+| Claude 3.5 Haiku | $0.000065 | $0.017 | $0.51 | ✅ Tested |
+
+*Costs calculated using 1.33 tokens/word ratio (approx. 13.3k tokens for 10k words) with an 85% Input / 15% Output split.*
 
 **Default:** Gemini 3 Flash Preview (`google/gemini-3-flash-preview`)
 
@@ -238,6 +240,12 @@ Edit to customize AI behavior
 - ✅ All keybindings functional
 - ✅ Analytics pipeline complete
 - ✅ Documentation comprehensive (800+ lines)
+
+---
+
+## 🚧 Todo
+
+- [ ] Update `analyze.py` to include "10k Words" cost calculation in the generated reports.
 
 ---
 

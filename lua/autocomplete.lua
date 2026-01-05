@@ -9,11 +9,23 @@ M.config = {
   temperature = 0.3,
   db_path = vim.fn.stdpath("data") .. "/autocomplete.db",
   system_prompt_file = vim.fn.expand("~/autocomplete-plugin/SYSTEM_PROMPT.md"),
+  auto_trigger = true,
+  auto_trigger_delay = 2000,
 }
+
+-- Timer for auto-trigger
+M.timer = nil
 
 -- Current completion state
 M.current_completion = nil
 M.current_request_id = nil
+
+-- Track last auto-trigger context to avoid re-triggering at same position
+M.last_trigger_context = nil
+
+-- Pending API results (for frontloading)
+M.pending_result = nil
+M.pending_timer = nil
 
 -- Initialize SQLite database
 local function init_db()
@@ -153,9 +165,18 @@ local function clear_preview()
     pcall(vim.keymap.del, 'i', '<C-r>')
     pcall(vim.keymap.del, 'i', '<C-l>')
     pcall(vim.keymap.del, 'i', '<C-d>')
-    pcall(vim.keymap.del, 'i', '<Esc>')
   end
   M.current_completion = nil
+
+  -- Clear pending results and timers
+  M.pending_result = nil
+  if M.pending_timer then
+    M.pending_timer:stop()
+    M.pending_timer = nil
+  end
+
+  -- Reset last trigger context so it can trigger again after changes
+  M.last_trigger_context = nil
 end
 
 -- Accept completion
@@ -248,34 +269,101 @@ function M.dismiss_completion()
   vim.notify("Completion dismissed", vim.log.levels.INFO)
 end
 
+-- Wrap text to fit window width
+local function wrap_text(text, max_width, first_line_offset)
+  first_line_offset = first_line_offset or 0
+  local wrapped_lines = {}
+
+  -- Split by newlines first
+  local lines = vim.split(text, "\n", { plain = true })
+
+  for line_idx, line in ipairs(lines) do
+    local available_width = max_width
+    -- First line has reduced width due to cursor position
+    if line_idx == 1 then
+      available_width = max_width - first_line_offset
+    end
+
+    -- If line fits, add it directly
+    if #line <= available_width then
+      table.insert(wrapped_lines, line)
+    else
+      -- Wrap long line into multiple lines
+      local remaining = line
+      local first_chunk = true
+
+      while #remaining > 0 do
+        local chunk_width = first_chunk and available_width or max_width
+
+        if #remaining <= chunk_width then
+          table.insert(wrapped_lines, remaining)
+          break
+        end
+
+        -- Try to break at word boundary
+        local chunk = string.sub(remaining, 1, chunk_width)
+        local last_space = chunk:match("^.*()%s")
+
+        if last_space and last_space > chunk_width * 0.5 then
+          -- Break at word boundary
+          table.insert(wrapped_lines, string.sub(remaining, 1, last_space - 1))
+          remaining = string.sub(remaining, last_space + 1)
+        else
+          -- Hard break
+          table.insert(wrapped_lines, chunk)
+          remaining = string.sub(remaining, chunk_width + 1)
+        end
+
+        first_chunk = false
+      end
+    end
+  end
+
+  return wrapped_lines
+end
+
 -- Show completion preview with virtual text
 local function show_preview(completion_text)
+  -- Hide blink.cmp ghost text and menu to avoid overlap
+  pcall(function() require('blink.cmp').hide() end)
+
   local cursor = vim.api.nvim_win_get_cursor(0)
   local row = cursor[1] - 1
   local col = cursor[2]
 
+  -- Get window width for wrapping
+  local win_width = vim.api.nvim_win_get_width(0)
+  -- Account for line numbers, sign column, etc.
+  local textoff = vim.fn.getwininfo(vim.api.nvim_get_current_win())[1].textoff
+  local available_width = win_width - textoff - 2 -- -2 for safety margin
+
   -- Create namespace for virtual text
   local ns_id = vim.api.nvim_create_namespace('autocomplete_preview')
 
-  -- Split completion into lines
-  local lines = vim.split(completion_text, "\n", { plain = true })
+  -- Wrap text to window width
+  local wrapped_lines = wrap_text(completion_text, available_width, col)
 
   -- Show first line as virtual text on current line
-  if #lines > 0 then
-    vim.api.nvim_buf_set_extmark(0, ns_id, row, col, {
-      virt_text = {{lines[1], "Comment"}},
+  if #wrapped_lines > 0 then
+    -- Prepare options for extmark
+    local extmark_opts = {
+      virt_text = {{wrapped_lines[1], "Comment"}},
       virt_text_pos = "overlay",
-    })
-  end
+      priority = 1000, -- High priority to ensure it shows over other text
+    }
 
-  -- Show remaining lines as virtual lines below
-  if #lines > 1 then
-    for i = 2, #lines do
-      vim.api.nvim_buf_set_extmark(0, ns_id, row, 0, {
-        virt_lines = {{{lines[i], "Comment"}}},
-        virt_lines_above = false,
-      })
+    -- If there are continuation lines, add them as virt_lines
+    if #wrapped_lines > 1 then
+      local continuation_lines = {}
+      for i = 2, #wrapped_lines do
+        table.insert(continuation_lines, {{wrapped_lines[i], "Comment"}})
+      end
+      extmark_opts.virt_lines = continuation_lines
+      extmark_opts.virt_lines_above = false
     end
+
+    -- Set single extmark with all the virtual text
+    vim.api.nvim_buf_set_extmark(0, ns_id, row, col, extmark_opts)
   end
 
   return ns_id
@@ -385,8 +473,112 @@ local function call_api(prompt_before, prompt_after, callback)
   })
 end
 
--- Trigger autocomplete
-function M.autocomplete()
+-- Frontload API call (call immediately, show later)
+local function autocomplete_frontload()
+  if M.config.api_key == "" then
+    return
+  end
+
+  -- Only make API call if in insert mode
+  local mode = vim.api.nvim_get_mode().mode
+  if mode ~= 'i' then
+    return
+  end
+
+  local before, after = get_context()
+  local filetype = vim.bo.filetype or "unknown"
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local context_snapshot = string.format("%d:%d:%s:%s", cursor[1], cursor[2], before, after)
+
+  -- Make API call immediately (in background)
+  call_api(before, after, function(result)
+    if result.completion and result.completion ~= "" then
+      -- Store result for later display
+      M.pending_result = {
+        result = result,
+        before = before,
+        after = after,
+        filetype = filetype,
+        context = context_snapshot,
+      }
+    end
+  end)
+end
+
+-- Show pending result (called after delay)
+local function show_pending_result()
+  if not M.pending_result then
+    return
+  end
+
+  local pending = M.pending_result
+  M.pending_result = nil
+
+  -- Verify context hasn't changed
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local before, after = get_context()
+  local current_context = string.format("%d:%d:%s:%s", cursor[1], cursor[2], before, after)
+
+  if current_context ~= pending.context then
+    -- Context changed, don't show stale result
+    return
+  end
+
+  -- Generate unique request ID
+  local request_id = string.format("%s_%d", M.config.model:gsub("/", "_"), os.time())
+
+  -- Log to database
+  log_completion({
+    request_id = request_id,
+    model = M.config.model,
+    prompt_before = pending.before,
+    prompt_after = pending.after,
+    completion = pending.result.completion,
+    prompt_tokens = pending.result.prompt_tokens,
+    completion_tokens = pending.result.completion_tokens,
+    total_tokens = pending.result.total_tokens,
+    cost = pending.result.cost,
+    response_time_ms = pending.result.response_time_ms,
+    filetype = pending.filetype,
+  })
+
+  -- Show preview
+  local ns_id = show_preview(pending.result.completion)
+
+  -- Store current completion
+  M.current_completion = {
+    text = pending.result.completion,
+    request_id = request_id,
+    ns_id = ns_id,
+    accepted = false,
+    keymaps_set = false,
+  }
+
+  -- Set up temporary keymaps
+  vim.keymap.set('i', '<Tab>', function()
+    M.accept_completion()
+  end, { buffer = true, desc = "Accept completion" })
+
+  vim.keymap.set('i', '<C-r>', function()
+    M.reject_completion()
+  end, { buffer = true, desc = "Reject and refresh completion" })
+
+  vim.keymap.set('i', '<C-l>', function()
+    M.like_completion()
+  end, { buffer = true, desc = "Like completion" })
+
+  vim.keymap.set('i', '<C-d>', function()
+    M.dislike_completion()
+  end, { buffer = true, desc = "Dislike completion" })
+
+  M.current_completion.keymaps_set = true
+
+  vim.notify("Tab: accept | Ctrl+R: refresh | Ctrl+L: like | Ctrl+D: dislike", vim.log.levels.INFO)
+end
+
+-- Trigger autocomplete (for manual triggering)
+function M.autocomplete(opts)
+  opts = opts or {}
   if M.config.api_key == "" then
     vim.notify("OPENROUTER_API_KEY not set", vim.log.levels.ERROR)
     return
@@ -398,7 +590,9 @@ function M.autocomplete()
   local before, after = get_context()
   local filetype = vim.bo.filetype or "unknown"
 
-  vim.notify("Getting completion...", vim.log.levels.INFO)
+  if not opts.silent then
+    vim.notify("Getting completion...", vim.log.levels.INFO)
+  end
 
   call_api(before, after, function(result)
     if result.completion and result.completion ~= "" then
@@ -449,13 +643,9 @@ function M.autocomplete()
         M.dislike_completion()
       end, { buffer = true, desc = "Dislike completion" })
 
-      vim.keymap.set('i', '<Esc>', function()
-        M.dismiss_completion()
-      end, { buffer = true, desc = "Dismiss completion" })
-
       M.current_completion.keymaps_set = true
 
-      vim.notify("Tab: accept | Ctrl+R: refresh | Ctrl+L: like | Ctrl+D: dislike | Esc: dismiss", vim.log.levels.INFO)
+      vim.notify("Tab: accept | Ctrl+R: refresh | Ctrl+L: like | Ctrl+D: dislike", vim.log.levels.INFO)
     end
   end)
 end
@@ -467,6 +657,64 @@ function M.setup(opts)
 
   -- Initialize database
   init_db()
+
+  -- Set up auto-dismiss when leaving insert mode
+  local dismiss_group = vim.api.nvim_create_augroup("AutocompleteDismiss", { clear = true })
+  vim.api.nvim_create_autocmd("InsertLeave", {
+    group = dismiss_group,
+    callback = function()
+      -- Auto-dismiss completion when leaving insert mode
+      if M.current_completion then
+        clear_preview()
+      end
+    end,
+  })
+
+  -- Set up auto-trigger if enabled
+  if M.config.auto_trigger then
+    local group = vim.api.nvim_create_augroup("AutocompleteAutoTrigger", { clear = true })
+    vim.api.nvim_create_autocmd({ "TextChangedI", "TextChangedP" }, {
+      group = group,
+      callback = function()
+        -- Don't trigger if we already have a completion shown
+        if M.current_completion then return end
+
+        -- Get current context
+        local cursor = vim.api.nvim_win_get_cursor(0)
+        local before, after = get_context()
+        local current_context = string.format("%d:%d:%s:%s", cursor[1], cursor[2], before, after)
+
+        -- Only proceed if context changed since last trigger
+        if current_context == M.last_trigger_context then
+          return
+        end
+
+        M.last_trigger_context = current_context
+
+        -- Cancel any pending display timers
+        if M.pending_timer then
+          M.pending_timer:stop()
+          M.pending_timer = nil
+        end
+
+        -- Clear any stale pending results
+        M.pending_result = nil
+
+        -- Start API call immediately (frontload)
+        autocomplete_frontload()
+
+        -- Set timer to show result after delay
+        M.pending_timer = vim.defer_fn(function()
+          -- Only show if still in insert mode and no completion is active
+          local mode = vim.api.nvim_get_mode().mode
+          if mode == 'i' and not M.current_completion then
+            show_pending_result()
+          end
+          M.pending_timer = nil
+        end, M.config.auto_trigger_delay)
+      end,
+    })
+  end
 
   -- Create commands
   vim.api.nvim_create_user_command('ClaudeComplete', M.autocomplete, {})
