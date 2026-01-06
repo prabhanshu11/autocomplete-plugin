@@ -274,6 +274,130 @@ sqlite3 ~/.local/share/nvim/autocomplete.db "SELECT model, COUNT(*), AVG(cost) F
 - Install Python 3: `sudo apt install python3`
 - Check database exists: `ls ~/.local/share/nvim/autocomplete.db`
 
+## Testing Recent Fixes
+
+The following issues were recently fixed and need testing to verify proper behavior:
+
+### Test 1: API Key Error Handling (401 Errors)
+
+**What was fixed:** Better error messages when API key is invalid or disabled.
+
+**How to test:**
+1. Temporarily set an invalid API key:
+   ```bash
+   export OPENROUTER_API_KEY="invalid-key-12345"
+   ```
+2. Restart Neovim
+3. Trigger a completion with `Ctrl+A`
+
+**Expected behavior:**
+- Should show error: `"API key invalid or disabled. Check: https://openrouter.ai/keys"`
+- Message should be clear and actionable (not raw JSON)
+
+**To restore:**
+```bash
+export OPENROUTER_API_KEY="your-real-api-key"
+```
+
+### Test 2: Tab Key Restoration After Dismiss
+
+**What was fixed:** Tab key now properly returns to normal behavior after dismissing completion with Escape.
+
+**How to test:**
+1. Trigger a completion with `Ctrl+A` (or wait for auto-trigger after 2 seconds of pause)
+2. When completion appears (gray text), press `Esc` to dismiss
+3. Immediately try pressing `Tab`
+
+**Expected behavior:**
+- `Tab` should insert spaces/tabs normally (not try to accept non-existent completion)
+- Escape key should work to dismiss completions
+- Tab should work normally in insert mode after dismissal
+
+**Additional test:**
+1. Trigger completion
+2. Press `Tab` to accept it
+3. Type more code
+4. Press `Tab` again
+
+**Expected:** Tab works normally after accepting completion too.
+
+### Test 3: Stale Completion Clearing
+
+**What was fixed:** Old completions now clear automatically when you continue typing.
+
+**How to test:**
+1. Type some code and stop for 2+ seconds (auto-trigger delay)
+2. Wait for completion suggestion to appear (gray text)
+3. **Without accepting or dismissing**, continue typing new characters
+
+**Expected behavior:**
+- Old completion should disappear immediately when you start typing
+- After pausing again (2 seconds), a NEW completion should appear at the new cursor position
+- Old suggestion should NOT persist while typing
+
+**Example scenario:**
+```javascript
+// Step 1: Type "function delete" and stop
+function delete
+// Gray suggestion appears: "Record(id) { ... }"
+
+// Step 2: Continue typing "RM" immediately
+function deleteRM
+// Expected: Old suggestion disappears, no ghost text visible
+
+// Step 3: Stop typing for 2+ seconds
+// Expected: NEW suggestion appears for "deleteRM..."
+```
+
+### Test 4: All Keymaps Working Together
+
+**What was fixed:** All keymaps (Tab, Escape, Ctrl+R, Ctrl+L, Ctrl+D) now properly work and cleanup.
+
+**How to test:**
+1. Trigger completion with `Ctrl+A`
+2. When suggestion appears, try each action:
+   - Press `Ctrl+L` (like) - should show "👍 Liked"
+   - Press `Ctrl+D` (dislike) - should show "👎 Disliked"
+   - Press `Ctrl+R` (reject/refresh) - should get new completion
+   - Press `Esc` (dismiss) - should clear and restore normal mode
+   - Press `Tab` (accept) - should insert completion text
+
+**Expected behavior:**
+- All keymaps work correctly
+- After any dismissal action, Tab/Esc return to normal behavior
+- No "stuck" keymaps that persist after completion is gone
+
+### Test 5: Auto-Trigger with Frontloading
+
+**What to verify:** Auto-trigger still works correctly after the fixes.
+
+**How to test:**
+1. Open a file in Neovim
+2. Type some code
+3. Stop typing and wait 2 seconds
+4. Completion should appear automatically
+
+**Expected behavior:**
+- After 2 seconds of no typing, completion appears
+- API call happens in background (frontloading)
+- No noticeable delay when completion displays
+
+### Reporting Issues
+
+If any test fails, please:
+1. Note which test failed and what happened instead
+2. Check `:messages` in Neovim for error details
+3. Report the issue with steps to reproduce
+4. Include your Neovim version (`:version`) and model being used
+
+### Automated Testing (Future Work)
+
+Currently all tests require manual interaction. Future improvements could include:
+- Unit tests for helper functions (e.g., `is_completion_stale()`)
+- Integration tests using Neovim headless mode
+- Mock API responses to test error handling
+- Automated keymap binding/unbinding tests
+
 ## Advanced: Custom Quality Metrics
 
 Edit `analyze.py` to customize the quality score formula:
