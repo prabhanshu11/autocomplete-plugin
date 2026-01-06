@@ -27,6 +27,9 @@ M.last_trigger_context = nil
 M.pending_result = nil
 M.pending_timer = nil
 
+-- Track completion position to detect stale completions
+M.completion_position = nil
+
 -- Initialize SQLite database
 local function init_db()
   local db_path = M.config.db_path
@@ -161,10 +164,11 @@ local function clear_preview()
   end
   if M.current_completion and M.current_completion.keymaps_set then
     -- Remove temporary keymaps
-    pcall(vim.keymap.del, 'i', '<Tab>')
-    pcall(vim.keymap.del, 'i', '<C-r>')
-    pcall(vim.keymap.del, 'i', '<C-l>')
-    pcall(vim.keymap.del, 'i', '<C-d>')
+    pcall(vim.keymap.del, 'i', '<Tab>', { buffer = 0 })
+    pcall(vim.keymap.del, 'i', '<Esc>', { buffer = 0 })
+    pcall(vim.keymap.del, 'i', '<C-r>', { buffer = 0 })
+    pcall(vim.keymap.del, 'i', '<C-l>', { buffer = 0 })
+    pcall(vim.keymap.del, 'i', '<C-d>', { buffer = 0 })
   end
   M.current_completion = nil
 
@@ -177,6 +181,17 @@ local function clear_preview()
 
   -- Reset last trigger context so it can trigger again after changes
   M.last_trigger_context = nil
+  M.completion_position = nil
+end
+
+-- Check if completion is stale (cursor moved)
+local function is_completion_stale()
+  if not M.current_completion or not M.completion_position then
+    return false
+  end
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  -- Stale if cursor row or column changed
+  return cursor[1] ~= M.completion_position.row or cursor[2] ~= M.completion_position.col
 end
 
 -- Accept completion
@@ -366,6 +381,9 @@ local function show_preview(completion_text)
     vim.api.nvim_buf_set_extmark(0, ns_id, row, col, extmark_opts)
   end
 
+  -- Track completion position for staleness detection
+  M.completion_position = { row = cursor[1], col = cursor[2] }
+
   return ns_id
 end
 
@@ -442,7 +460,14 @@ local function call_api(prompt_before, prompt_after, callback)
       local response_time_ms = math.floor((vim.loop.hrtime() - start_time) / 1000000)
 
       if response.status ~= 200 then
-        vim.notify("OpenRouter API Error: " .. (response.body or "Unknown error"), vim.log.levels.ERROR)
+        if response.status == 401 then
+          vim.notify(
+            "API key invalid or disabled. Check: https://openrouter.ai/keys",
+            vim.log.levels.ERROR
+          )
+        else
+          vim.notify("OpenRouter API Error: " .. (response.body or "Unknown error"), vim.log.levels.ERROR)
+        end
         return
       end
 
@@ -571,6 +596,10 @@ local function show_pending_result()
     M.dislike_completion()
   end, { buffer = true, desc = "Dislike completion" })
 
+  vim.keymap.set('i', '<Esc>', function()
+    M.dismiss_completion()
+  end, { buffer = true, desc = "Dismiss completion" })
+
   M.current_completion.keymaps_set = true
 
   vim.notify("Tab: accept | Ctrl+R: refresh | Ctrl+L: like | Ctrl+D: dislike", vim.log.levels.INFO)
@@ -643,6 +672,10 @@ function M.autocomplete(opts)
         M.dislike_completion()
       end, { buffer = true, desc = "Dislike completion" })
 
+      vim.keymap.set('i', '<Esc>', function()
+        M.dismiss_completion()
+      end, { buffer = true, desc = "Dismiss completion" })
+
       M.current_completion.keymaps_set = true
 
       vim.notify("Tab: accept | Ctrl+R: refresh | Ctrl+L: like | Ctrl+D: dislike", vim.log.levels.INFO)
@@ -676,8 +709,14 @@ function M.setup(opts)
     vim.api.nvim_create_autocmd({ "TextChangedI", "TextChangedP" }, {
       group = group,
       callback = function()
-        -- Don't trigger if we already have a completion shown
-        if M.current_completion then return end
+        -- Check if current completion is stale (cursor moved)
+        if M.current_completion then
+          if is_completion_stale() then
+            clear_preview()
+          else
+            return
+          end
+        end
 
         -- Get current context
         local cursor = vim.api.nvim_win_get_cursor(0)
