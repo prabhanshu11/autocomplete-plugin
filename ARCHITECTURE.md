@@ -473,7 +473,7 @@ local sql = string.format([[
 
 ```lua
 -- CURRENT: Hardcoded in source (DEVELOPMENT ONLY!)
-api_key = "sk-or-v1-..."
+-- api key comes from $OPENROUTER_API_KEY or `pass show api/openrouter`
 
 -- PRODUCTION: Must use environment variable
 api_key = os.getenv("OPENROUTER_API_KEY")

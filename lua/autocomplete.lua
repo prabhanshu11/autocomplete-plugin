@@ -1,784 +1,475 @@
+-- AI autocomplete for Neovim, backed by OpenRouter.
+--
+-- One trigger key in insert mode asks for THREE candidate completions of different
+-- length for the same cursor position (short / medium / long). The first one to
+-- arrive is shown as ghost text; <leader>h / <leader>l (or <leader>1/2/3) switch
+-- between lengths while the ghost text is visible, Tab accepts, typing dismisses.
+-- Failures (offline, bad key, dead model) are ONE quiet warning, never an error trace.
+
 local M = {}
 
+local ns = vim.api.nvim_create_namespace("ai_autocomplete")
+local LOG_LEVELS = vim.log.levels
+
+---------------------------------------------------------------------------
 -- Configuration
+---------------------------------------------------------------------------
 M.config = {
-  api_key = os.getenv("OPENROUTER_API_KEY") or "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",
-  model = "google/gemini-3-flash-preview",  -- Default to Gemini 3 Flash
-  thinking_enabled = false,
-  max_tokens = 200,
+  url = "https://openrouter.ai/api/v1/chat/completions",
+  models_url = "https://openrouter.ai/api/v1/models",
+  -- Resolved lazily: $OPENROUTER_API_KEY, else `pass show api/openrouter`.
+  api_key = nil,
+  model = "anthropic/claude-haiku-5.5",
+  -- Curated list shown first in the model picker (prices as of 2026-11-10, USD per 1M tokens).
+  models = {
+    { id = "anthropic/claude-haiku-5.5", note = "fast, cheap; in 0.10 / out 0.50" },
+    { id = "google/gemini-2.5-flash-lite", note = "cheapest Gemini; in 0.10 / out 0.40" },
+    { id = "google/gemini-3.1-flash-lite", note = "newer Gemini lite; in 0.25 / out 1.50" },
+    { id = "openai/gpt-5-nano", note = "cheapest OpenAI; in 0.05 / out 0.40" },
+    { id = "openai/gpt-5-mini", note = "in 0.25 / out 2.00" },
+    { id = "qwen/qwen3-coder-flash", note = "code-tuned; in 0.20 / out 0.98" },
+    { id = "mistralai/codestral-2508", note = "code-tuned; in 0.30 / out 0.90" },
+    { id = "moonshotai/kimi-k2.7-code", note = "code-tuned; in 0.60 / out 3.50" },
+    { id = "deepseek/deepseek-chat", note = "in 0.32 / out 0.89" },
+  },
   temperature = 0.3,
-  db_path = vim.fn.stdpath("data") .. "/autocomplete.db",
-  system_prompt_file = vim.fn.expand("~/autocomplete-plugin/SYSTEM_PROMPT.md"),
-  auto_trigger = true,
-  auto_trigger_delay = 2000,
+  timeout_s = 20,
+  context = { before = 80, after = 30 }, -- lines of context sent around the cursor
+  lengths = {
+    { name = "short", max_tokens = 32,
+      instruction = "Complete only the current word or phrase: at most about 6 words. Never go past the end of the current sentence or line." },
+    { name = "medium", max_tokens = 100,
+      instruction = "Complete the current sentence, line or statement. One line; two at most if the line is clearly mid-statement." },
+    { name = "long", max_tokens = 400,
+      instruction = "Continue the text for the next 3 to 8 lines: finish the current thought and write the next logical step in the same style." },
+  },
+  default_length = 2, -- medium
+  keymaps = {
+    trigger = "<C-Space>", -- insert mode, always
+    -- Insert mode, only while ghost text is visible (so Space stays a plain Space otherwise):
+    shorter = "<leader>h",
+    longer = "<leader>l",
+    pick = { "<leader>1", "<leader>2", "<leader>3" },
+    model = "<leader>m",
+    dismiss = "<C-e>",
+    -- Normal mode, always:
+    model_normal = "<leader>am",
+  },
+  hl = "Comment",
+  log_file = vim.fn.stdpath("data") .. "/autocomplete-log.jsonl",
+  model_file = vim.fn.stdpath("data") .. "/autocomplete-model",
+  system_prompt = table.concat({
+    "You are an inline autocomplete engine inside a text editor.",
+    "You receive the text before and after the cursor. Reply with ONLY the text to insert at the cursor:",
+    "no explanation, no quotes, no markdown fences, no leading label.",
+    "Never repeat text that is already before the cursor. Match the language, style, indentation and tone of the surrounding text.",
+    "If the text is prose or notes, continue the prose; if it is code, continue the code.",
+  }, " "),
 }
 
--- Timer for auto-trigger
-M.timer = nil
+---------------------------------------------------------------------------
+-- State
+---------------------------------------------------------------------------
+local S = {
+  gen = 0,          -- request generation; replies from older generations are dropped
+  buf = nil,
+  row = nil, col = nil,
+  candidates = {},  -- index -> text
+  idx = nil,        -- which candidate is shown
+  extmark = nil,
+  keymaps_set = false,
+  accepting = false,
+  warned = false,   -- one warning per generation
+  pending = 0,
+  started = nil,
+}
 
--- Current completion state
-M.current_completion = nil
-M.current_request_id = nil
-
--- Track last auto-trigger context to avoid re-triggering at same position
-M.last_trigger_context = nil
-
--- Pending API results (for frontloading)
-M.pending_result = nil
-M.pending_timer = nil
-
--- Track completion position to detect stale completions
-M.completion_position = nil
-
--- Initialize SQLite database
-local function init_db()
-  local db_path = M.config.db_path
-
-  -- Create database and tables if they don't exist
-  local init_sql = string.format([[
-sqlite3 "%s" << 'EOF'
-CREATE TABLE IF NOT EXISTS completions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  request_id TEXT NOT NULL,
-  timestamp TEXT NOT NULL,
-  model TEXT NOT NULL,
-  prompt_before TEXT NOT NULL,
-  prompt_after TEXT NOT NULL,
-  completion TEXT NOT NULL,
-  prompt_tokens INTEGER,
-  completion_tokens INTEGER,
-  total_tokens INTEGER,
-  cost REAL,
-  response_time_ms INTEGER,
-  accepted INTEGER DEFAULT 0,
-  liked INTEGER DEFAULT NULL,
-  filetype TEXT,
-  reviewed_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_model ON completions(model);
-CREATE INDEX IF NOT EXISTS idx_timestamp ON completions(timestamp);
-CREATE INDEX IF NOT EXISTS idx_accepted ON completions(accepted);
-CREATE INDEX IF NOT EXISTS idx_liked ON completions(liked);
-EOF
-]], db_path)
-
-  os.execute(init_sql)
+local function echo(msg, hl)
+  vim.api.nvim_echo({ { msg, hl or "ModeMsg" } }, false, {})
 end
 
--- Log completion to database
-local function log_completion(data)
-  local db_path = M.config.db_path
-
-  local sql = string.format([[
-sqlite3 "%s" << 'EOF'
-INSERT INTO completions (
-  request_id, timestamp, model, prompt_before, prompt_after,
-  completion, prompt_tokens, completion_tokens, total_tokens,
-  cost, response_time_ms, filetype
-) VALUES (
-  '%s', '%s', '%s', '%s', '%s',
-  '%s', %d, %d, %d,
-  %f, %d, '%s'
-);
-EOF
-]],
-    db_path,
-    data.request_id:gsub("'", "''"),
-    os.date("%Y-%m-%d %H:%M:%S"),
-    data.model:gsub("'", "''"),
-    data.prompt_before:gsub("'", "''"):gsub("\n", "\\n"),
-    data.prompt_after:gsub("'", "''"):gsub("\n", "\\n"),
-    data.completion:gsub("'", "''"):gsub("\n", "\\n"),
-    data.prompt_tokens or 0,
-    data.completion_tokens or 0,
-    data.total_tokens or 0,
-    data.cost or 0,
-    data.response_time_ms or 0,
-    data.filetype:gsub("'", "''")
-  )
-
-  vim.fn.jobstart({"bash", "-c", sql}, {detach = true})
+local function warn(msg)
+  vim.notify("AI autocomplete: " .. msg, LOG_LEVELS.WARN, { title = "AI autocomplete" })
 end
 
--- Update completion review
-local function update_review(request_id, accepted, liked)
-  local db_path = M.config.db_path
+local function log(event)
+  local f = io.open(M.config.log_file, "a")
+  if not f then return end
+  event.ts = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  f:write(vim.json.encode(event), "\n")
+  f:close()
+end
 
-  local liked_value = "NULL"
-  if liked ~= nil then
-    liked_value = liked and "1" or "0"
+---------------------------------------------------------------------------
+-- API key
+---------------------------------------------------------------------------
+local key_cache
+local function get_key()
+  if key_cache then return key_cache end
+  local env = os.getenv("OPENROUTER_API_KEY")
+  if env and env ~= "" then key_cache = env; return key_cache end
+  if M.config.api_key and M.config.api_key ~= "" then key_cache = M.config.api_key; return key_cache end
+  local ok, res = pcall(function()
+    return vim.system({ "timeout", "8", "pass", "show", "api/openrouter" }, { text = true }):wait()
+  end)
+  if ok and res and res.code == 0 then
+    local line = (res.stdout or ""):match("^[^\n]*")
+    if line and line ~= "" then key_cache = line; return key_cache end
   end
-
-  local sql = string.format([[
-sqlite3 "%s" "UPDATE completions SET accepted = %d, liked = %s, reviewed_at = '%s' WHERE request_id = '%s';"
-]],
-    db_path,
-    accepted and 1 or 0,
-    liked_value,
-    os.date("%Y-%m-%d %H:%M:%S"),
-    request_id:gsub("'", "''")
-  )
-
-  vim.fn.jobstart({"bash", "-c", sql}, {detach = true})
+  return nil
 end
 
--- Toggle thinking mode
-function M.toggle_thinking()
-  M.config.thinking_enabled = not M.config.thinking_enabled
-  local status = M.config.thinking_enabled and "ON" or "OFF"
-  vim.notify("Extended Thinking: " .. status, vim.log.levels.INFO)
+---------------------------------------------------------------------------
+-- Model persistence
+---------------------------------------------------------------------------
+local function load_model()
+  local f = io.open(M.config.model_file, "r")
+  if not f then return end
+  local m = (f:read("*l") or ""):gsub("%s+$", "")
+  f:close()
+  if m ~= "" then M.config.model = m end
 end
 
--- Get context from current buffer
-local function get_context()
-  local buf = vim.api.nvim_get_current_buf()
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local row = cursor[1]
-  local col = cursor[2]
+function M.set_model(id)
+  M.config.model = id
+  local f = io.open(M.config.model_file, "w")
+  if f then f:write(id, "\n"); f:close() end
+  vim.notify("AI autocomplete model: " .. id, LOG_LEVELS.INFO, { title = "AI autocomplete" })
+  log({ event = "model", model = id })
+end
 
-  -- Get all lines
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-
-  -- Get before and after cursor
-  local before_cursor = table.concat(vim.list_slice(lines, 1, row - 1), "\n")
-  if row > 0 then
-    before_cursor = before_cursor .. "\n" .. string.sub(lines[row], 1, col)
+---------------------------------------------------------------------------
+-- Ghost text
+---------------------------------------------------------------------------
+local function clear(opts)
+  opts = opts or {}
+  if S.extmark and S.buf and vim.api.nvim_buf_is_valid(S.buf) then
+    pcall(vim.api.nvim_buf_del_extmark, S.buf, ns, S.extmark)
   end
-
-  local after_cursor = ""
-  if row <= #lines then
-    after_cursor = string.sub(lines[row], col + 1) .. "\n"
-    if row < #lines then
-      after_cursor = after_cursor .. table.concat(vim.list_slice(lines, row + 1, #lines), "\n")
+  S.extmark = nil
+  if S.keymaps_set and S.buf and vim.api.nvim_buf_is_valid(S.buf) then
+    local km = M.config.keymaps
+    for _, lhs in ipairs({ km.shorter, km.longer, km.model, km.dismiss, km.pick[1], km.pick[2], km.pick[3] }) do
+      pcall(vim.keymap.del, "i", lhs, { buffer = S.buf })
     end
+    if not M._lazyvim_tab then pcall(vim.keymap.del, "i", "<Tab>", { buffer = S.buf }) end
+    S.keymaps_set = false
   end
-
-  return before_cursor, after_cursor
+  if not opts.keep then
+    S.candidates, S.idx = {}, nil
+    S.gen = S.gen + 1 -- drops any reply still in flight
+    S.pending = 0
+    echo("")
+  end
 end
 
--- Clear virtual text completion preview
-local function clear_preview()
-  if M.current_completion and M.current_completion.ns_id then
-    vim.api.nvim_buf_clear_namespace(0, M.current_completion.ns_id, 0, -1)
+local function status_line()
+  local parts = {}
+  for i, l in ipairs(M.config.lengths) do
+    local mark = S.candidates[i] and "" or "…"
+    local name = l.name .. mark
+    if i == S.idx then name = "[" .. name .. "]" end
+    parts[#parts + 1] = name
   end
-  if M.current_completion and M.current_completion.keymaps_set then
-    -- Remove temporary keymaps
-    pcall(vim.keymap.del, 'i', '<Tab>', { buffer = 0 })
-    pcall(vim.keymap.del, 'i', '<Esc>', { buffer = 0 })
-    pcall(vim.keymap.del, 'i', '<C-r>', { buffer = 0 })
-    pcall(vim.keymap.del, 'i', '<C-l>', { buffer = 0 })
-    pcall(vim.keymap.del, 'i', '<C-d>', { buffer = 0 })
-  end
-  M.current_completion = nil
-
-  -- Clear pending results and timers
-  M.pending_result = nil
-  if M.pending_timer then
-    M.pending_timer:stop()
-    M.pending_timer = nil
-  end
-
-  -- Reset last trigger context so it can trigger again after changes
-  M.last_trigger_context = nil
-  M.completion_position = nil
+  local km = M.config.keymaps
+  local leader = (vim.g.mapleader == " " or vim.g.mapleader == nil) and "Space " or vim.g.mapleader
+  local function k(lhs) return (lhs:gsub("<[Ll]eader>", leader)) end
+  return string.format("AI %s  %s  Tab accept · %s/%s length · %s model · %s dismiss",
+    M.config.model:match("[^/]+$"), table.concat(parts, " "), k(km.shorter), k(km.longer), k(km.model), k(km.dismiss))
 end
 
--- Check if completion is stale (cursor moved)
-local function is_completion_stale()
-  if not M.current_completion or not M.completion_position then
-    return false
+local function set_keymaps()
+  if S.keymaps_set then return end
+  local km = M.config.keymaps
+  local o = { buffer = S.buf, silent = true, desc = "AI autocomplete" }
+  vim.keymap.set("i", km.shorter, function() M.cycle(-1) end, o)
+  vim.keymap.set("i", km.longer, function() M.cycle(1) end, o)
+  for i, lhs in ipairs(km.pick) do
+    vim.keymap.set("i", lhs, function() M.show(i) end, o)
   end
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  -- Stale if cursor row or column changed
-  return cursor[1] ~= M.completion_position.row or cursor[2] ~= M.completion_position.col
+  vim.keymap.set("i", km.model, function() M.pick_model() end, o)
+  vim.keymap.set("i", km.dismiss, function() clear() end, o)
+  if not M._lazyvim_tab then
+    vim.keymap.set("i", "<Tab>", function() M.accept() end, o)
+  end
+  S.keymaps_set = true
 end
 
--- Accept completion
-function M.accept_completion()
-  if not M.current_completion then
-    return
+function M.show(i)
+  if not S.buf or not vim.api.nvim_buf_is_valid(S.buf) then return end
+  S.idx = i
+  local text = S.candidates[i]
+  if S.extmark then pcall(vim.api.nvim_buf_del_extmark, S.buf, ns, S.extmark); S.extmark = nil end
+  if text then
+    local lines = vim.split(text, "\n", { plain = true })
+    local opts = {
+      virt_text = { { lines[1], M.config.hl } },
+      virt_text_pos = "inline",
+      hl_mode = "combine",
+    }
+    if #lines > 1 then
+      opts.virt_lines = {}
+      for j = 2, #lines do opts.virt_lines[#opts.virt_lines + 1] = { { lines[j], M.config.hl } } end
+    end
+    S.extmark = vim.api.nvim_buf_set_extmark(S.buf, ns, S.row, S.col, opts)
+    set_keymaps()
   end
-
-  local completion = M.current_completion.text
-  local request_id = M.current_completion.request_id
-
-  -- Clear preview
-  clear_preview()
-
-  -- Insert completion at cursor
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local row = cursor[1] - 1
-  local col = cursor[2]
-
-  -- Split completion into lines
-  local lines = vim.split(completion, "\n", { plain = true })
-
-  -- Insert the completion
-  vim.api.nvim_buf_set_text(0, row, col, row, col, lines)
-
-  -- Move cursor to end of insertion
-  if #lines > 1 then
-    vim.api.nvim_win_set_cursor(0, {row + #lines, #lines[#lines]})
-  else
-    vim.api.nvim_win_set_cursor(0, {row + 1, col + #lines[1]})
-  end
-
-  -- Log acceptance
-  update_review(request_id, true, nil)
-
-  vim.notify("Completion accepted", vim.log.levels.INFO)
+  echo(status_line())
 end
 
--- Reject completion and request new one
-function M.reject_completion()
-  if not M.current_completion then
-    return
-  end
-
-  local request_id = M.current_completion.request_id
-
-  -- Log rejection
-  update_review(request_id, false, nil)
-
-  -- Clear and get new completion
-  clear_preview()
-  vim.notify("Rejected. Getting new completion...", vim.log.levels.INFO)
-  M.autocomplete()
+function M.cycle(dir)
+  if not S.idx then return end
+  local n = #M.config.lengths
+  M.show(((S.idx - 1 + dir) % n) + 1)
 end
 
--- Like completion
-function M.like_completion()
-  if not M.current_completion then
-    return
-  end
-
-  local request_id = M.current_completion.request_id
-  update_review(request_id, M.current_completion.accepted or false, true)
-
-  vim.notify("👍 Liked", vim.log.levels.INFO)
-end
-
--- Dislike completion
-function M.dislike_completion()
-  if not M.current_completion then
-    return
-  end
-
-  local request_id = M.current_completion.request_id
-  update_review(request_id, M.current_completion.accepted or false, false)
-
-  vim.notify("👎 Disliked", vim.log.levels.INFO)
-end
-
--- Dismiss completion
-function M.dismiss_completion()
-  if not M.current_completion then
-    return
-  end
-
-  local request_id = M.current_completion.request_id
-  update_review(request_id, false, nil)
-
-  clear_preview()
-  vim.notify("Completion dismissed", vim.log.levels.INFO)
-end
-
--- Wrap text to fit window width
-local function wrap_text(text, max_width, first_line_offset)
-  first_line_offset = first_line_offset or 0
-  local wrapped_lines = {}
-
-  -- Split by newlines first
+function M.accept()
+  local text = S.idx and S.candidates[S.idx]
+  if not text or not S.buf or not vim.api.nvim_buf_is_valid(S.buf) then return false end
   local lines = vim.split(text, "\n", { plain = true })
-
-  for line_idx, line in ipairs(lines) do
-    local available_width = max_width
-    -- First line has reduced width due to cursor position
-    if line_idx == 1 then
-      available_width = max_width - first_line_offset
-    end
-
-    -- If line fits, add it directly
-    if #line <= available_width then
-      table.insert(wrapped_lines, line)
-    else
-      -- Wrap long line into multiple lines
-      local remaining = line
-      local first_chunk = true
-
-      while #remaining > 0 do
-        local chunk_width = first_chunk and available_width or max_width
-
-        if #remaining <= chunk_width then
-          table.insert(wrapped_lines, remaining)
-          break
-        end
-
-        -- Try to break at word boundary
-        local chunk = string.sub(remaining, 1, chunk_width)
-        local last_space = chunk:match("^.*()%s")
-
-        if last_space and last_space > chunk_width * 0.5 then
-          -- Break at word boundary
-          table.insert(wrapped_lines, string.sub(remaining, 1, last_space - 1))
-          remaining = string.sub(remaining, last_space + 1)
-        else
-          -- Hard break
-          table.insert(wrapped_lines, chunk)
-          remaining = string.sub(remaining, chunk_width + 1)
-        end
-
-        first_chunk = false
-      end
-    end
-  end
-
-  return wrapped_lines
+  S.accepting = true
+  pcall(vim.api.nvim_buf_set_text, S.buf, S.row, S.col, S.row, S.col, lines)
+  local end_row = S.row + #lines - 1
+  local end_col = (#lines == 1) and (S.col + #lines[1]) or #lines[#lines]
+  pcall(vim.api.nvim_win_set_cursor, 0, { end_row + 1, end_col })
+  log({ event = "accept", model = M.config.model, length = M.config.lengths[S.idx].name, chars = #text })
+  clear()
+  vim.schedule(function() S.accepting = false end)
+  return true
 end
 
--- Show completion preview with virtual text
-local function show_preview(completion_text)
-  -- Hide blink.cmp ghost text and menu to avoid overlap
-  pcall(function() require('blink.cmp').hide() end)
-
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local row = cursor[1] - 1
-  local col = cursor[2]
-
-  -- Get window width for wrapping
-  local win_width = vim.api.nvim_win_get_width(0)
-  -- Account for line numbers, sign column, etc.
-  local textoff = vim.fn.getwininfo(vim.api.nvim_get_current_win())[1].textoff
-  local available_width = win_width - textoff - 2 -- -2 for safety margin
-
-  -- Create namespace for virtual text
-  local ns_id = vim.api.nvim_create_namespace('autocomplete_preview')
-
-  -- Wrap text to window width
-  local wrapped_lines = wrap_text(completion_text, available_width, col)
-
-  -- Show first line as virtual text on current line
-  if #wrapped_lines > 0 then
-    -- Prepare options for extmark
-    local extmark_opts = {
-      virt_text = {{wrapped_lines[1], "Comment"}},
-      virt_text_pos = "overlay",
-      priority = 1000, -- High priority to ensure it shows over other text
-    }
-
-    -- If there are continuation lines, add them as virt_lines
-    if #wrapped_lines > 1 then
-      local continuation_lines = {}
-      for i = 2, #wrapped_lines do
-        table.insert(continuation_lines, {{wrapped_lines[i], "Comment"}})
-      end
-      extmark_opts.virt_lines = continuation_lines
-      extmark_opts.virt_lines_above = false
-    end
-
-    -- Set single extmark with all the virtual text
-    vim.api.nvim_buf_set_extmark(0, ns_id, row, col, extmark_opts)
-  end
-
-  -- Track completion position for staleness detection
-  M.completion_position = { row = cursor[1], col = cursor[2] }
-
-  return ns_id
+---------------------------------------------------------------------------
+-- Request
+---------------------------------------------------------------------------
+local function context_text(buf, row, col)
+  local c = M.config.context
+  local first = math.max(0, row - c.before)
+  local before_lines = vim.api.nvim_buf_get_lines(buf, first, row + 1, false)
+  local cur = before_lines[#before_lines] or ""
+  before_lines[#before_lines] = cur:sub(1, col)
+  local after_lines = vim.api.nvim_buf_get_lines(buf, row, row + 1 + c.after, false)
+  after_lines[1] = (after_lines[1] or ""):sub(col + 1)
+  return table.concat(before_lines, "\n"), table.concat(after_lines, "\n")
 end
 
--- Load system prompt from file
-local function load_system_prompt()
-  local default_prompt = [[Act like an intelligent autocomplete. You will receive code with a cursor position marked by <CURSOR>. Your job is to predict what the user wants to type next. Output ONLY the completion text - no explanations, no markdown, no additional commentary. Be concise and contextual. Complete the current thought, statement, or logical block.]]
-
-  local prompt_file = M.config.system_prompt_file
-  if not prompt_file or not vim.fn.filereadable(prompt_file) == 1 then
-    return default_prompt
+local function tidy(text, before)
+  if not text then return nil end
+  text = text:gsub("^%s*```[%w_-]*\n", ""):gsub("\n```%s*$", "")
+  text = text:gsub("\n+$", "")
+  -- Models often echo the tail of the text before the cursor; strip the longest such echo.
+  local tail = before:sub(-60)
+  for n = #tail, 1, -1 do
+    local piece = tail:sub(-n)
+    if text:sub(1, n) == piece then text = text:sub(n + 1); break end
   end
-
-  -- Read the file
-  local file = io.open(vim.fn.expand(prompt_file), "r")
-  if not file then
-    return default_prompt
+  if text:match("^%s*$") then return nil end
+  -- Models often drop the space between the word before the cursor and the first new word.
+  if before:sub(-1):match("[%w%p]") and not before:sub(-1):match("[%(%[{\"'`/.:@#$-]") and text:sub(1, 1):match("%w") then
+    text = " " .. text
   end
-
-  local content = file:read("*all")
-  file:close()
-
-  -- Extract prompt from markdown code block
-  local prompt = content:match("```\n(.-)\n```")
-  if prompt and prompt ~= "" then
-    return prompt
-  end
-
-  return default_prompt
+  return text
 end
 
--- Call OpenRouter API
-local function call_api(prompt_before, prompt_after, callback)
-  local curl = require('plenary.curl')
-  local start_time = vim.loop.hrtime()
-
-  local system_prompt = load_system_prompt()
-  local prompt = prompt_before .. "<CURSOR>" .. prompt_after
-
-  local messages = {
-    {
-      role = "system",
-      content = system_prompt
-    },
-    {
-      role = "user",
-      content = prompt
-    }
-  }
-
-  local body = {
+local function request_one(gen, i, key, before, after, ft)
+  local len = M.config.lengths[i]
+  local body = vim.json.encode({
     model = M.config.model,
-    max_tokens = M.config.max_tokens,
     temperature = M.config.temperature,
-    messages = messages,
-  }
-
-  -- OpenRouter extended thinking for Claude models (if enabled)
-  if M.config.thinking_enabled and string.match(M.config.model, "claude") then
-    body.thinking = {
-      type = "enabled",
-      budget_tokens = 1000
-    }
-  end
-
-  curl.post('https://openrouter.ai/api/v1/chat/completions', {
-    headers = {
-      ['Content-Type'] = 'application/json',
-      ['Authorization'] = 'Bearer ' .. M.config.api_key,
-      ['HTTP-Referer'] = 'https://github.com/autocomplete-plugin',
-      ['X-Title'] = 'Neovim Autocomplete',
+    max_tokens = len.max_tokens,
+    messages = {
+      { role = "system", content = M.config.system_prompt .. " Filetype: " .. (ft ~= "" and ft or "plain text") .. ". " .. len.instruction },
+      { role = "user", content = "<text_before_cursor>\n" .. before .. "\n</text_before_cursor>\n<text_after_cursor>\n" .. after .. "\n</text_after_cursor>" },
     },
-    body = vim.json.encode(body),
-    callback = vim.schedule_wrap(function(response)
-      local response_time_ms = math.floor((vim.loop.hrtime() - start_time) / 1000000)
-
-      if response.status ~= 200 then
-        if response.status == 401 then
-          vim.notify(
-            "API key invalid or disabled. Check: https://openrouter.ai/keys",
-            vim.log.levels.ERROR
-          )
+  })
+  local body_file = vim.fn.tempname()
+  local f = io.open(body_file, "w"); if not f then return end
+  f:write(body); f:close()
+  local t0 = vim.uv.hrtime()
+  -- The key goes in via a curl config on stdin, so it is never in argv or on disk.
+  local cmd = { "curl", "-sS", "--max-time", tostring(M.config.timeout_s), "-K", "-",
+    "-H", "Content-Type: application/json", "-H", "HTTP-Referer: nvim-autocomplete", "-H", "X-Title: nvim autocomplete",
+    "-d", "@" .. body_file, M.config.url }
+  vim.system(cmd, { stdin = 'header = "Authorization: Bearer ' .. key .. '"\n', text = true }, function(res)
+    vim.schedule(function()
+      pcall(os.remove, body_file)
+      if gen ~= S.gen then return end -- stale
+      S.pending = S.pending - 1
+      local ms = math.floor((vim.uv.hrtime() - t0) / 1e6)
+      local text, err
+      if res.code ~= 0 then
+        if res.code == 6 or res.code == 7 then err = "offline (no connection to openrouter.ai)"
+        elseif res.code == 28 then err = "timed out after " .. M.config.timeout_s .. "s"
+        else err = "curl exit " .. res.code .. " " .. ((res.stderr or ""):match("[^\n]*") or "") end
+      else
+        local ok, data = pcall(vim.json.decode, res.stdout or "")
+        if not ok or type(data) ~= "table" then err = "unreadable reply"
+        elseif data.error then err = (data.error.message or "API error"):sub(1, 160)
         else
-          vim.notify("OpenRouter API Error: " .. (response.body or "Unknown error"), vim.log.levels.ERROR)
+          local ch = data.choices and data.choices[1]
+          text = ch and ch.message and ch.message.content
+          if type(text) ~= "string" then err = "empty reply" end
         end
+      end
+      log({ event = "reply", model = M.config.model, length = len.name, ms = ms, ok = err == nil, err = err })
+      if err then
+        if not S.warned then S.warned = true; warn(err) end
+        if S.pending == 0 and not S.idx then clear() end
         return
       end
-
-      local ok, data = pcall(vim.json.decode, response.body)
-      if not ok then
-        vim.notify("Failed to parse API response", vim.log.levels.ERROR)
-        return
+      text = tidy(text, before)
+      if text then
+        S.candidates[i] = text
+        if not S.idx then
+          M.show(i)
+        elseif i == M.config.default_length and S.candidates[S.idx] == nil then
+          M.show(i)
+        else
+          echo(status_line())
+        end
+      elseif S.pending == 0 and not S.idx then
+        echo("AI: nothing to add here")
       end
-
-      -- Extract text from OpenAI-compatible response
-      local completion = ""
-      if data.choices and data.choices[1] and data.choices[1].message then
-        completion = data.choices[1].message.content or ""
-      end
-
-      -- Extract usage and cost info
-      local usage = data.usage or {}
-
-      callback({
-        completion = completion,
-        prompt_tokens = usage.prompt_tokens or 0,
-        completion_tokens = usage.completion_tokens or 0,
-        total_tokens = usage.total_tokens or 0,
-        cost = usage.cost or 0,
-        response_time_ms = response_time_ms,
-      })
-    end),
-  })
+    end)
+  end)
 end
 
--- Frontload API call (call immediately, show later)
-local function autocomplete_frontload()
-  if M.config.api_key == "" then
+function M.trigger()
+  if vim.fn.mode() ~= "i" then return end
+  local key = get_key()
+  if not key then
+    warn("no API key: export OPENROUTER_API_KEY or `pass insert api/openrouter`")
     return
   end
-
-  -- Only make API call if in insert mode
-  local mode = vim.api.nvim_get_mode().mode
-  if mode ~= 'i' then
-    return
+  clear()
+  pcall(function() require("blink.cmp").hide() end)
+  S.buf = vim.api.nvim_get_current_buf()
+  local pos = vim.api.nvim_win_get_cursor(0)
+  S.row, S.col = pos[1] - 1, pos[2]
+  S.warned = false
+  S.pending = #M.config.lengths
+  local gen = S.gen
+  local before, after = context_text(S.buf, S.row, S.col)
+  local ft = vim.bo[S.buf].filetype
+  echo("AI: asking " .. M.config.model .. " …")
+  for i = 1, #M.config.lengths do
+    request_one(gen, i, key, before, after, ft)
   end
+end
 
-  local before, after = get_context()
-  local filetype = vim.bo.filetype or "unknown"
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local context_snapshot = string.format("%d:%d:%s:%s", cursor[1], cursor[2], before, after)
+---------------------------------------------------------------------------
+-- Model picker
+---------------------------------------------------------------------------
+local function fmt_price(p)
+  local n = tonumber(p)
+  if not n then return "?" end
+  return string.format("%.2f", n * 1e6)
+end
 
-  -- Make API call immediately (in background)
-  call_api(before, after, function(result)
-    if result.completion and result.completion ~= "" then
-      -- Store result for later display
-      M.pending_result = {
-        result = result,
-        before = before,
-        after = after,
-        filetype = filetype,
-        context = context_snapshot,
-      }
+function M.browse_models()
+  local key = get_key()
+  echo("AI: fetching model list …")
+  local cmd = { "curl", "-sS", "--max-time", "20", M.config.models_url }
+  if key then table.insert(cmd, #cmd, "-H"); table.insert(cmd, #cmd, "Authorization: Bearer " .. key) end
+  vim.system(cmd, { text = true }, function(res)
+    vim.schedule(function()
+      local ok, data = pcall(vim.json.decode, res.stdout or "")
+      if res.code ~= 0 or not ok or type(data) ~= "table" or not data.data then
+        warn("could not fetch the model list" .. (res.code ~= 0 and " (offline?)" or ""))
+        return
+      end
+      local items = {}
+      for _, m in ipairs(data.data) do
+        local pr = m.pricing or {}
+        items[#items + 1] = { id = m.id, label = string.format("%-50s in %6s  out %6s  ctx %s",
+          m.id, fmt_price(pr.prompt), fmt_price(pr.completion), tostring(m.context_length or "?")) }
+      end
+      table.sort(items, function(a, b) return a.id < b.id end)
+      echo("")
+      vim.ui.select(items, {
+        prompt = "OpenRouter model (" .. #items .. ", USD per 1M tokens)",
+        format_item = function(it) return it.label end,
+      }, function(choice)
+        if choice then M.set_model(choice.id) end
+      end)
+    end)
+  end)
+end
+
+function M.pick_model()
+  local items = { { id = nil, label = "Browse all OpenRouter models …" } }
+  for _, m in ipairs(M.config.models) do
+    local cur = (m.id == M.config.model) and "● " or "  "
+    items[#items + 1] = { id = m.id, label = string.format("%s%-36s %s", cur, m.id, m.note or "") }
+  end
+  -- Opening a picker leaves insert mode; remember where we were so a pick can resume and re-ask.
+  local resume
+  if vim.fn.mode() == "i" then
+    local pos = vim.api.nvim_win_get_cursor(0)
+    local line = vim.api.nvim_get_current_line()
+    resume = function()
+      if pos[2] >= #line then vim.cmd("startinsert!")
+      else vim.api.nvim_win_set_cursor(0, pos); vim.cmd("startinsert") end
+      vim.schedule(M.trigger)
+    end
+  end
+  vim.ui.select(items, {
+    prompt = "AI autocomplete model (current: " .. M.config.model .. ")",
+    format_item = function(it) return it.label end,
+  }, function(choice)
+    if not choice then return end
+    if choice.id then
+      M.set_model(choice.id)
+      if resume then vim.schedule(resume) end
+    else
+      M.browse_models()
     end
   end)
 end
 
--- Show pending result (called after delay)
-local function show_pending_result()
-  if not M.pending_result then
-    return
-  end
-
-  local pending = M.pending_result
-  M.pending_result = nil
-
-  -- Verify context hasn't changed
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local before, after = get_context()
-  local current_context = string.format("%d:%d:%s:%s", cursor[1], cursor[2], before, after)
-
-  if current_context ~= pending.context then
-    -- Context changed, don't show stale result
-    return
-  end
-
-  -- Generate unique request ID
-  local request_id = string.format("%s_%d", M.config.model:gsub("/", "_"), os.time())
-
-  -- Log to database
-  log_completion({
-    request_id = request_id,
-    model = M.config.model,
-    prompt_before = pending.before,
-    prompt_after = pending.after,
-    completion = pending.result.completion,
-    prompt_tokens = pending.result.prompt_tokens,
-    completion_tokens = pending.result.completion_tokens,
-    total_tokens = pending.result.total_tokens,
-    cost = pending.result.cost,
-    response_time_ms = pending.result.response_time_ms,
-    filetype = pending.filetype,
-  })
-
-  -- Show preview
-  local ns_id = show_preview(pending.result.completion)
-
-  -- Store current completion
-  M.current_completion = {
-    text = pending.result.completion,
-    request_id = request_id,
-    ns_id = ns_id,
-    accepted = false,
-    keymaps_set = false,
-  }
-
-  -- Set up temporary keymaps
-  vim.keymap.set('i', '<Tab>', function()
-    M.accept_completion()
-  end, { buffer = true, desc = "Accept completion" })
-
-  vim.keymap.set('i', '<C-r>', function()
-    M.reject_completion()
-  end, { buffer = true, desc = "Reject and refresh completion" })
-
-  vim.keymap.set('i', '<C-l>', function()
-    M.like_completion()
-  end, { buffer = true, desc = "Like completion" })
-
-  vim.keymap.set('i', '<C-d>', function()
-    M.dislike_completion()
-  end, { buffer = true, desc = "Dislike completion" })
-
-  vim.keymap.set('i', '<Esc>', function()
-    M.dismiss_completion()
-  end, { buffer = true, desc = "Dismiss completion" })
-
-  M.current_completion.keymaps_set = true
-
-  vim.notify("Tab: accept | Ctrl+R: refresh | Ctrl+L: like | Ctrl+D: dislike", vim.log.levels.INFO)
-end
-
--- Trigger autocomplete (for manual triggering)
-function M.autocomplete(opts)
-  opts = opts or {}
-  if M.config.api_key == "" then
-    vim.notify("OPENROUTER_API_KEY not set", vim.log.levels.ERROR)
-    return
-  end
-
-  -- Clear any existing preview
-  clear_preview()
-
-  local before, after = get_context()
-  local filetype = vim.bo.filetype or "unknown"
-
-  if not opts.silent then
-    vim.notify("Getting completion...", vim.log.levels.INFO)
-  end
-
-  call_api(before, after, function(result)
-    if result.completion and result.completion ~= "" then
-      -- Generate unique request ID
-      local request_id = string.format("%s_%d", M.config.model:gsub("/", "_"), os.time())
-
-      -- Log to database
-      log_completion({
-        request_id = request_id,
-        model = M.config.model,
-        prompt_before = before,
-        prompt_after = after,
-        completion = result.completion,
-        prompt_tokens = result.prompt_tokens,
-        completion_tokens = result.completion_tokens,
-        total_tokens = result.total_tokens,
-        cost = result.cost,
-        response_time_ms = result.response_time_ms,
-        filetype = filetype,
-      })
-
-      -- Show preview
-      local ns_id = show_preview(result.completion)
-
-      -- Store current completion
-      M.current_completion = {
-        text = result.completion,
-        request_id = request_id,
-        ns_id = ns_id,
-        accepted = false,
-        keymaps_set = false,
-      }
-
-      -- Set up temporary keymaps for this completion
-      vim.keymap.set('i', '<Tab>', function()
-        M.accept_completion()
-      end, { buffer = true, desc = "Accept completion" })
-
-      vim.keymap.set('i', '<C-r>', function()
-        M.reject_completion()
-      end, { buffer = true, desc = "Reject and refresh completion" })
-
-      vim.keymap.set('i', '<C-l>', function()
-        M.like_completion()
-      end, { buffer = true, desc = "Like completion" })
-
-      vim.keymap.set('i', '<C-d>', function()
-        M.dislike_completion()
-      end, { buffer = true, desc = "Dislike completion" })
-
-      vim.keymap.set('i', '<Esc>', function()
-        M.dismiss_completion()
-      end, { buffer = true, desc = "Dismiss completion" })
-
-      M.current_completion.keymaps_set = true
-
-      vim.notify("Tab: accept | Ctrl+R: refresh | Ctrl+L: like | Ctrl+D: dislike", vim.log.levels.INFO)
-    end
-  end)
-end
-
--- Setup function
+---------------------------------------------------------------------------
+-- Setup
+---------------------------------------------------------------------------
 function M.setup(opts)
-  opts = opts or {}
-  M.config = vim.tbl_deep_extend("force", M.config, opts)
+  M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  load_model()
+  local km = M.config.keymaps
 
-  -- Initialize database
-  init_db()
+  vim.keymap.set("i", km.trigger, M.trigger, { desc = "AI autocomplete: suggest", silent = true })
+  vim.keymap.set("n", km.model_normal, M.pick_model, { desc = "AI autocomplete: pick model" })
 
-  -- Set up auto-dismiss when leaving insert mode
-  local dismiss_group = vim.api.nvim_create_augroup("AutocompleteDismiss", { clear = true })
-  vim.api.nvim_create_autocmd("InsertLeave", {
-    group = dismiss_group,
+  -- LazyVim routes <Tab> through its "ai_accept" action (works with blink.cmp's own Tab mapping).
+  if _G.LazyVim and LazyVim.cmp and LazyVim.cmp.actions then
+    M._lazyvim_tab = true
+    LazyVim.cmp.actions.ai_accept = function()
+      if S.idx and S.candidates[S.idx] then return M.accept() end
+    end
+  end
+
+  local group = vim.api.nvim_create_augroup("ai_autocomplete", { clear = true })
+  vim.api.nvim_create_autocmd({ "TextChangedI", "InsertLeave", "BufLeave" }, {
+    group = group,
     callback = function()
-      -- Auto-dismiss completion when leaving insert mode
-      if M.current_completion then
-        clear_preview()
-      end
+      if S.accepting then return end
+      if S.idx or S.pending > 0 then clear() end
+    end,
+  })
+  vim.api.nvim_create_autocmd("CursorMovedI", {
+    group = group,
+    callback = function()
+      if S.accepting or not S.idx then return end
+      local pos = vim.api.nvim_win_get_cursor(0)
+      if pos[1] - 1 ~= S.row or pos[2] ~= S.col then clear() end
     end,
   })
 
-  -- Set up auto-trigger if enabled
-  if M.config.auto_trigger then
-    local group = vim.api.nvim_create_augroup("AutocompleteAutoTrigger", { clear = true })
-    vim.api.nvim_create_autocmd({ "TextChangedI", "TextChangedP" }, {
-      group = group,
-      callback = function()
-        -- Check if current completion is stale (cursor moved)
-        if M.current_completion then
-          if is_completion_stale() then
-            clear_preview()
-          else
-            return
-          end
-        end
-
-        -- Get current context
-        local cursor = vim.api.nvim_win_get_cursor(0)
-        local before, after = get_context()
-        local current_context = string.format("%d:%d:%s:%s", cursor[1], cursor[2], before, after)
-
-        -- Only proceed if context changed since last trigger
-        if current_context == M.last_trigger_context then
-          return
-        end
-
-        M.last_trigger_context = current_context
-
-        -- Cancel any pending display timers
-        if M.pending_timer then
-          M.pending_timer:stop()
-          M.pending_timer = nil
-        end
-
-        -- Clear any stale pending results
-        M.pending_result = nil
-
-        -- Start API call immediately (frontload)
-        autocomplete_frontload()
-
-        -- Set timer to show result after delay
-        M.pending_timer = vim.defer_fn(function()
-          -- Only show if still in insert mode and no completion is active
-          local mode = vim.api.nvim_get_mode().mode
-          if mode == 'i' and not M.current_completion then
-            show_pending_result()
-          end
-          M.pending_timer = nil
-        end, M.config.auto_trigger_delay)
-      end,
-    })
-  end
-
-  -- Create commands
-  vim.api.nvim_create_user_command('ClaudeComplete', M.autocomplete, {})
-  vim.api.nvim_create_user_command('ClaudeToggleThinking', M.toggle_thinking, {})
-  vim.api.nvim_create_user_command('ClaudeAccept', M.accept_completion, {})
-  vim.api.nvim_create_user_command('ClaudeReject', M.reject_completion, {})
-  vim.api.nvim_create_user_command('ClaudeLike', M.like_completion, {})
-  vim.api.nvim_create_user_command('ClaudeDislike', M.dislike_completion, {})
-
-  -- Set up keymaps if provided
-  if opts.keymaps then
-    if opts.keymaps.complete then
-      vim.keymap.set('i', opts.keymaps.complete, function()
-        M.autocomplete()
-      end, { desc = "Trigger autocomplete" })
-    end
-
-    if opts.keymaps.toggle_thinking then
-      vim.keymap.set('n', opts.keymaps.toggle_thinking, function()
-        M.toggle_thinking()
-      end, { desc = "Toggle thinking mode" })
-    end
-  end
-
-  vim.notify("Autocomplete plugin loaded. DB: " .. M.config.db_path, vim.log.levels.INFO)
+  vim.api.nvim_create_user_command("AiComplete", function() vim.cmd("startinsert"); vim.schedule(M.trigger) end, {})
+  vim.api.nvim_create_user_command("AiModel", M.pick_model, {})
+  vim.api.nvim_create_user_command("AiModelBrowse", M.browse_models, {})
+  vim.api.nvim_create_user_command("AiLog", function() vim.cmd("edit " .. M.config.log_file) end, {})
 end
+
+-- exposed for tests
+M._state = S
+M._tidy = tidy
 
 return M
