@@ -473,7 +473,7 @@ local sql = string.format([[
 
 ```lua
 -- CURRENT: Hardcoded in source (DEVELOPMENT ONLY!)
--- api key comes from $OPENROUTER_API_KEY or `pass show api/openrouter`
+-- api key comes from $OPENROUTER_API_KEY or `pass show api/openrouter/nvim_autocomplete`
 
 -- PRODUCTION: Must use environment variable
 api_key = os.getenv("OPENROUTER_API_KEY")

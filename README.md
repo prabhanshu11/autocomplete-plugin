@@ -27,7 +27,7 @@ The chosen model persists in `stdpath("data")/autocomplete-model`.
 
 ## Setup
 
-API key: `$OPENROUTER_API_KEY`, else `pass show api/openrouter` (first line). The key is
+API key: `$OPENROUTER_API_KEY`, else `pass show api/openrouter/nvim_autocomplete` (first line). The key is
 handed to curl through a config on stdin, never on the command line.
 
 lazy.nvim spec (the one used in local-bootstrapping `dotfiles/nvim/lua/plugins/autocomplete-ai.lua`):

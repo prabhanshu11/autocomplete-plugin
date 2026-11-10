@@ -17,7 +17,7 @@ local LOG_LEVELS = vim.log.levels
 M.config = {
   url = "https://openrouter.ai/api/v1/chat/completions",
   models_url = "https://openrouter.ai/api/v1/models",
-  -- Resolved lazily: $OPENROUTER_API_KEY, else `pass show api/openrouter`.
+  -- Resolved lazily: $OPENROUTER_API_KEY, else `pass show api/openrouter/nvim_autocomplete`.
   api_key = nil,
   model = "anthropic/claude-haiku-5.5",
   -- Curated list shown first in the model picker (prices as of 2026-11-10, USD per 1M tokens).
@@ -110,7 +110,7 @@ local function get_key()
   if env and env ~= "" then key_cache = env; return key_cache end
   if M.config.api_key and M.config.api_key ~= "" then key_cache = M.config.api_key; return key_cache end
   local ok, res = pcall(function()
-    return vim.system({ "timeout", "8", "pass", "show", "api/openrouter" }, { text = true }):wait()
+    return vim.system({ "timeout", "8", "pass", "show", "api/openrouter/nvim_autocomplete" }, { text = true }):wait()
   end)
   if ok and res and res.code == 0 then
     local line = (res.stdout or ""):match("^[^\n]*")
@@ -337,7 +337,7 @@ function M.trigger()
   if vim.fn.mode() ~= "i" then return end
   local key = get_key()
   if not key then
-    warn("no API key: export OPENROUTER_API_KEY or `pass insert api/openrouter`")
+    warn("no API key: export OPENROUTER_API_KEY or `pass insert api/openrouter/nvim_autocomplete`")
     return
   end
   clear()
